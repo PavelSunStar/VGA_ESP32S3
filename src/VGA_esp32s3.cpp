@@ -1,0 +1,1394 @@
+#include <Arduino.h>
+#include "VGA_esp32s3.h"
+#include <esp_log.h>
+#include <esp_lcd_panel_ops.h>
+#include <string.h>
+#include "VGA_Pins.h"
+#include "VGA_Math.h"
+
+// default pin values chosen to avoid conflicting with spi, i2c, or serial.
+
+#define VGA_PIN_NUM_HSYNC          1
+#define VGA_PIN_NUM_VSYNC          2
+#define VGA_PIN_NUM_DE             -1
+
+// note: PCLK pin is not needed for VGA output.
+// however, the current version of the esp lcd rgb driver requires this to be set
+// to keep this pin unused and available for something else, you need a patched version
+// of the driver (for now)
+#if PATCHED_LCD_DRIVER
+#define VGA_PIN_NUM_PCLK           -1
+#else
+#define VGA_PIN_NUM_PCLK           -1//21
+#endif
+
+/*
+#define VGA_PIN_NUM_DATA0          14
+#define VGA_PIN_NUM_DATA1          15
+#define VGA_PIN_NUM_DATA2          8
+#define VGA_PIN_NUM_DATA3          9
+#define VGA_PIN_NUM_DATA4          10
+#define VGA_PIN_NUM_DATA5          2
+#define VGA_PIN_NUM_DATA6          3
+#define VGA_PIN_NUM_DATA7          4
+*/
+#define VGA_PIN_NUM_DISP_EN        -1
+
+static const char *TAG = "vga";
+
+VGA_esp32s3::VGA_esp32s3() {
+    // Код конструктора: здесь можно инициализировать переменные или выделить ресурсы
+    Serial.begin(115200);
+    Serial.println("VGA_esp32s3 constructor called.");
+}
+
+VGA_esp32s3::~VGA_esp32s3() {
+    // Код деструктора: здесь можно освободить ресурсы, закрыть соединения и т.д.
+    Serial.println("VGA_esp32s3 destructor called.");
+}
+
+/*
+void VGA_esp32s3::setViewport(int x1, int x2, int y1, int y2){
+    if (x1 > x2) swap(x1, x2);
+    if (y1 > y2) swap(y1, y2);
+    if (x1 < 0) x1 = 0; if (x2 > _frameWidth - 1) x2 = _frameWidth - 1;
+    if (y1 < 0) y1 = 0; if (y2 > _frameHeight - 1) x2 = _frameHeight - 1;
+
+    _vX1 = x1;
+    _vY1 = y1;
+    _vX2 = x2;
+    _vY2 = y2;
+    _vWidth = x2 - x1 + 1;
+    _vHeight = y2 - y1 + 1;
+}
+*/
+
+bool VGA_esp32s3::initWithSize(int frameWidth, int frameHeight, int bits, bool dBuff) {
+    int hborder = 9999;
+    int vborder = 9999;
+
+    int rw[6];
+    int rh[6];
+    int best = -1;
+
+    rw[0] = 320;
+    rh[0] = 200;
+
+    rw[1] = 320;
+    rh[1] = 240;
+
+    rw[2] = 400;
+    rh[2] = 300;
+
+    rw[3] = 640;
+    rh[3] = 400;
+
+    rw[4] = 640;
+    rh[4] = 480;
+
+    rw[5] = 800;
+    rh[5] = 600;
+
+    for (int rr = 0; rr < 6; rr++) {
+        if (frameWidth > rw[rr] || frameHeight > rh[rr]) {
+            continue;
+        }
+
+        int hb = (rw[rr] - frameWidth) / 2;
+        int vb = (rh[rr] - frameHeight) / 2;
+
+        if ((hb + vb) <= (hborder + vborder)) {
+            hborder = hb;
+            vborder = vb;
+            best = rr;
+        }
+    }
+
+    if (best == -1) {
+        ESP_LOGI(TAG, "could not initialize with %d %d", frameWidth, frameHeight);
+        return false;
+    }
+
+    int scale = 1;
+    if (best < 3) {
+        scale = 2;
+    }
+    int screenWidth = rw[best] * scale;
+    int screenHeight = rh[best] * scale;
+
+    ESP_LOGI(TAG, "frame %d %d: screen %d %d %d %d %d", frameWidth, frameHeight, screenWidth, screenHeight, scale, hborder, vborder);
+    Serial.printf("Free heap: %d\n", ESP.getFreeHeap());
+    Serial.printf("Largest block: %d\n", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+
+    if (init(screenWidth, screenHeight, scale, hborder, vborder, bits, NULL, true)){
+        _dBuff = dBuff;
+        return true;
+    }    
+
+    return false;
+}
+
+bool VGA_esp32s3::validConfig(int width, int height, int scale, int hborder, int vborder, int bits, int* pins, bool usePsram) {
+
+    if (scale < 1 || scale > 2) {
+        return false;
+    }
+
+    if (width == 800 && height == 600) {
+        return true;
+    } else if (width == 640 && height == 480) {
+        return true;
+    } else if (width == 640 && height == 400) {
+        return true;
+    } else if (width == 640 && height == 350) {
+        return true;
+    }
+
+    return false;
+}
+
+bool VGA_esp32s3::init(int width, int height, int scale, int hborder, int vborder, int bits, int* pins, bool usePsram) {
+
+    if (!validConfig(width, height, scale, hborder, vborder, bits, pins, usePsram)) {
+        ESP_LOGE(TAG, "error: invalid configuration");
+        return false;
+    }
+
+	// temp replace
+	_frameScale = scale;
+	_frameWidth = width / _frameScale;
+	_frameHeight = height / _frameScale;
+
+    //set viewport
+    _vX1 = 0; _vY1 = 0; 
+    _vX2 = _frameWidth - 1;
+    _vY2 = _frameHeight - 1;
+    _vWidth = _vX2 - _vX1 + 1;
+    _vHeight = _vY2 - _vY1 + 1;
+
+    _hBorder = hborder;
+    _frameWidth -= (2*_hBorder);
+
+    _vBorder = vborder;
+    _frameHeight -= (2*_vBorder);
+
+	_screenWidth = width;
+	_screenHeight = height;
+    _colorBits = bits;
+    _bytePerPixel = (_colorBits == 16) ? 2 : 1;
+    _bounceBufferLines = height / 10;
+
+    int pixelClockHz = 0;
+    if (width == 800 && height == 600) {
+        pixelClockHz = 40000000;
+    } else if (width == 640 && height == 480) {
+        pixelClockHz = 25000000;
+    } else if (width == 640 && height == 400) {
+        // note: nominal pixel frequency here is 25.175 MHz
+        // 25.0 MHz experimentally shown to generate a less noisy picture,
+        // since this is more cleanly generated by the internal oscillator
+        pixelClockHz = 25000000;
+    } else if (width == 640 && height == 350) {
+        pixelClockHz = 25000000;
+    }
+
+	ESP_LOGI(TAG, "Create semaphores");
+    _sem_vsync_end = xSemaphoreCreateBinary();
+    assert(_sem_vsync_end);
+    _sem_gui_ready = xSemaphoreCreateBinary();
+    assert(_sem_gui_ready);
+
+	ESP_LOGI(TAG, "Install RGB LCD panel driver");
+    esp_lcd_rgb_panel_config_t panel_config;
+    memset(&panel_config, 0, sizeof(esp_lcd_rgb_panel_config_t));
+
+    panel_config.data_width = (_colorBits == 16) ? 16 : 8;
+    panel_config.psram_trans_align = 64,
+    panel_config.num_fbs = 0;//+
+    panel_config.clk_src = LCD_CLK_SRC_PLL240M;//+
+    panel_config.bounce_buffer_size_px = _bounceBufferLines * _screenWidth;
+    panel_config.disp_gpio_num = -1;//+
+    
+    panel_config.pclk_gpio_num = VGA_PIN_NUM_PCLK;//+
+    panel_config.vsync_gpio_num = VGA_PIN_NUM_VSYNC;//+
+    panel_config.hsync_gpio_num = VGA_PIN_NUM_HSYNC;//+
+    panel_config.de_gpio_num = VGA_PIN_NUM_DE;//+
+
+    // set defaults for pins
+// Настраиваем GPIO для 16-битного или 8-битного режима
+    if (_colorBits == 16) {
+        //B
+        panel_config.data_gpio_nums[0]  = VGA_PIN_NUM_DATA15;
+        panel_config.data_gpio_nums[1]  = VGA_PIN_NUM_DATA14;
+        panel_config.data_gpio_nums[2]  = VGA_PIN_NUM_DATA13;
+        panel_config.data_gpio_nums[3]  = VGA_PIN_NUM_DATA12;
+        panel_config.data_gpio_nums[4]  = VGA_PIN_NUM_DATA11;
+
+        //G
+        panel_config.data_gpio_nums[5]  = VGA_PIN_NUM_DATA10;
+        panel_config.data_gpio_nums[6]  = VGA_PIN_NUM_DATA9;
+        panel_config.data_gpio_nums[7]  = VGA_PIN_NUM_DATA8;
+        panel_config.data_gpio_nums[8]  = VGA_PIN_NUM_DATA7;
+        panel_config.data_gpio_nums[9]  = VGA_PIN_NUM_DATA6;
+        panel_config.data_gpio_nums[10] = VGA_PIN_NUM_DATA5;
+
+        //R
+        panel_config.data_gpio_nums[11] = VGA_PIN_NUM_DATA4;
+        panel_config.data_gpio_nums[12] = VGA_PIN_NUM_DATA3;
+        panel_config.data_gpio_nums[13] = VGA_PIN_NUM_DATA2;
+        panel_config.data_gpio_nums[14] = VGA_PIN_NUM_DATA1;
+        panel_config.data_gpio_nums[15] = VGA_PIN_NUM_DATA0;
+    } else {
+        //B
+        panel_config.data_gpio_nums[0] = VGA_PIN_NUM_DATA12;
+        panel_config.data_gpio_nums[1] = VGA_PIN_NUM_DATA11;
+        
+        //G
+        panel_config.data_gpio_nums[2] = VGA_PIN_NUM_DATA7;
+        panel_config.data_gpio_nums[3] = VGA_PIN_NUM_DATA6;
+        panel_config.data_gpio_nums[4] = VGA_PIN_NUM_DATA5;
+
+        //R
+        panel_config.data_gpio_nums[5] = VGA_PIN_NUM_DATA2;
+        panel_config.data_gpio_nums[6] = VGA_PIN_NUM_DATA1;
+        panel_config.data_gpio_nums[7] = VGA_PIN_NUM_DATA0;
+    }
+/*
+    // check for pin definitions
+    if (pins) {
+        for (int i = 0; i < 8; i++) {
+            if (i < bits) {
+                panel_config.data_gpio_nums[i] = pins[i];
+            }
+        }
+    }
+*/        
+    panel_config.timings.pclk_hz = pixelClockHz;//+
+    panel_config.timings.h_res = _screenWidth;//+
+    panel_config.timings.v_res = _screenHeight;//+
+    
+    // timings for different VGA resolutions
+    if (width == 800 && height == 600) {
+        panel_config.timings.hsync_back_porch = 88;
+        panel_config.timings.hsync_front_porch = 40;
+        panel_config.timings.hsync_pulse_width = 128;
+        panel_config.timings.vsync_back_porch = 23;
+        panel_config.timings.vsync_front_porch = 1;
+        panel_config.timings.vsync_pulse_width = 4;
+    } else if (width == 640 && height == 480) {
+        panel_config.timings.hsync_back_porch = 48;//+
+        panel_config.timings.hsync_front_porch = 16;//+
+        panel_config.timings.hsync_pulse_width = 96;//+
+        panel_config.timings.vsync_back_porch = 33;//+
+        panel_config.timings.vsync_front_porch = 10;//+
+        panel_config.timings.vsync_pulse_width = 2;//+
+    } else if (width == 640 && height == 400) {
+        panel_config.timings.hsync_back_porch = 48;
+        panel_config.timings.hsync_front_porch = 16;
+        panel_config.timings.hsync_pulse_width = 96;
+        panel_config.timings.vsync_back_porch = 35;
+        panel_config.timings.vsync_front_porch = 12;
+        panel_config.timings.vsync_pulse_width = 2;
+    } else if (width == 640 && height == 350) {
+        panel_config.timings.hsync_back_porch = 48;
+        panel_config.timings.hsync_front_porch = 16;
+        panel_config.timings.hsync_pulse_width = 96;
+        panel_config.timings.vsync_back_porch = 60;
+        panel_config.timings.vsync_front_porch = 37;
+        panel_config.timings.vsync_pulse_width = 2;
+    }
+
+    panel_config.timings.flags.pclk_active_neg = true;//+
+    panel_config.timings.flags.hsync_idle_low = 0;//+
+    panel_config.timings.flags.vsync_idle_low = 0;//+
+
+    panel_config.flags.fb_in_psram = 0;//+
+    panel_config.flags.double_fb = 0;//+
+    panel_config.flags.no_fb = 1;//+
+
+    ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_config, &_panel_handle));
+
+    // allocate frame buffers in memory
+    int fbSize = _frameWidth*_frameHeight;
+    if (_colorBits == 16){
+        fbSize *= 2;
+    } else if (_colorBits == 3) {
+        fbSize /= 2;
+    } else if (_colorBits == 1) {
+        fbSize /= 8;
+    }
+
+    _frameBuffersInPsram = usePsram;
+    for (int i = 0; i < 2; i++) {
+        if (usePsram) {
+             ESP_LOGI(TAG, "allocating in spi ram");
+            if (_colorBits == 16){
+                _frameBuffers16[i] = (uint16_t*)heap_caps_malloc(fbSize, MALLOC_CAP_SPIRAM);
+            } else {
+                _frameBuffers[i] = (uint8_t*)heap_caps_malloc(fbSize, MALLOC_CAP_SPIRAM);
+            }
+        } else {
+            ESP_LOGI(TAG, "allocating in main memory");
+            if (_colorBits == 16){
+                 _frameBuffers16[i] = (uint16_t*)malloc(fbSize);
+            } else {
+                _frameBuffers[i] = (uint8_t*)malloc(fbSize);
+            }   
+        }
+        if (_colorBits == 16){
+            assert(_frameBuffers16[i]);
+        } else {
+            assert(_frameBuffers[i]);
+        }
+    }
+
+    if (_colorBits == 16){
+        memset(_frameBuffers16[0], 0, fbSize);
+        memset(_frameBuffers16[1], 0, fbSize);
+    } else {
+        memset(_frameBuffers[0], 0, fbSize);
+        memset(_frameBuffers[1], 0, fbSize);
+    }    
+    _lastBounceBufferPos = _screenWidth*(_screenHeight-_bounceBufferLines);
+
+    ESP_LOGI(TAG, "Register event callbacks");
+    Serial.printf("vsyncEvent address: %p\n", (void*)vsyncEvent);
+ 
+    esp_lcd_rgb_panel_event_callbacks_t cbs = {
+    	.on_vsync = vsyncEvent,
+        .on_bounce_empty = bounceEvent,
+    };
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(_panel_handle, &cbs, this));
+
+    ESP_LOGI(TAG, "Initialize RGB LCD panel");
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(_panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(_panel_handle));
+    ESP_LOGI(TAG, "Init complete");
+
+    return true;
+}
+
+bool VGA_esp32s3::deinit() {
+    esp_err_t err = esp_lcd_panel_del(_panel_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "error deleting rgb lcd panel");
+        return false;
+    }
+
+    _panel_handle = NULL;
+
+    for (int i = 0; i < 2; i++) {
+        if (_frameBuffersInPsram) {
+            heap_caps_free(_frameBuffers[i]);
+        } else {
+            free(_frameBuffers[i]);
+        }
+        _frameBuffers[i] = NULL;
+    }
+
+    return true;
+}
+
+void VGA_esp32s3::vsyncWait() {
+	// get draw semaphore
+    if (_dBuff){
+        xSemaphoreGive(_sem_gui_ready);
+        xSemaphoreTake(_sem_vsync_end, portMAX_DELAY);
+    }
+}
+
+uint16_t* VGA_esp32s3::getDrawBuffer16() {
+	if (_dBuff){
+        if (_frameBufferIndex == 0) {
+		    return _frameBuffers16[1];
+	    } else {
+		    return _frameBuffers16[0];
+        }
+    } else {
+        return _frameBuffers16[0];
+    }
+}
+
+uint8_t* VGA_esp32s3::getDrawBuffer() {
+	if (_dBuff){
+        if (_frameBufferIndex == 0) {
+		    return _frameBuffers[1];
+	    } else {
+		    return _frameBuffers[0];
+        }
+    } else {
+        return _frameBuffers[0];
+    }
+}
+
+bool IRAM_ATTR VGA_esp32s3::vsyncEvent(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx) {
+    return true;
+}
+
+void VGA_esp32s3::swapBuffers() {
+    if (xSemaphoreTakeFromISR(_sem_gui_ready, NULL) == pdTRUE) {
+        if (_frameBufferIndex == 0) {
+            _frameBufferIndex = 1;
+        } else {
+            _frameBufferIndex = 0;
+        }
+        xSemaphoreGiveFromISR(_sem_vsync_end, NULL);
+    }
+}
+
+bool IRAM_ATTR VGA_esp32s3::bounceEvent(esp_lcd_panel_handle_t panel, void* bounce_buf, int pos_px, int len_bytes, void* user_ctx) {
+	VGA_esp32s3* vga = (VGA_esp32s3*)user_ctx;
+
+    if (vga->_colorBits == 16) {
+        uint16_t* bbuf = (uint16_t*)bounce_buf;
+        bool skip = false;
+
+        int pixelsPerByte = 1;
+        int screenLineIndex = pos_px / vga->_screenWidth;
+        int bufLineIndex = screenLineIndex / vga->_frameScale; 
+
+        bufLineIndex -= vga->_vBorder;
+        if (bufLineIndex >= vga->_frameHeight) {
+            // past the bottom of the frame
+            memset(bounce_buf, 0, len_bytes << 1);
+            if (pos_px >= vga->_lastBounceBufferPos) {
+             vga->swapBuffers();
+            }
+        return true;
+        }  
+
+        if (bufLineIndex < 0) {
+            int lineAdj = (-bufLineIndex)*vga->_frameScale;
+            int pxAdj = lineAdj*vga->_screenWidth;
+            if (pxAdj >= len_bytes) {
+                // this buffer should be empty, before the first line of the frame
+                // clear
+                memset(bounce_buf, 0, len_bytes << 1);
+                return true;
+            }
+
+            memset(bounce_buf, 0, pxAdj << 1);
+            bbuf += pxAdj;
+            len_bytes -= pxAdj;
+            bufLineIndex = 0;
+        }  
+
+        uint16_t* pptr = vga->_frameBuffers16[vga->_frameBufferIndex] + (bufLineIndex*vga->_frameWidth);
+        int screenLines = len_bytes / vga->_screenWidth;
+        int lines = screenLines / vga->_frameScale;
+/*
+        if (lines > (vga->_frameHeight-bufLineIndex)) {
+            int ll = vga->_frameHeight-bufLineIndex;
+            int clearLines = lines-ll;
+            lines = ll;
+
+            int screenClearIndex = lines * vga->_frameScale;
+            int screenClearLines = clearLines * vga->_frameScale;
+            uint16_t* clearPtr = bbuf + (screenClearIndex*vga->_screenWidth);
+            memset(clearPtr, 0, screenClearLines*vga->_screenWidth << 1);
+        }
+*/
+        if (vga->_frameScale == 1) {
+        // just copy the bytes
+        if (vga->_hBorder == 0 && vga->_vBorder == 0) {
+            uint16_t* bbptr = (uint16_t*)bbuf;
+            int copyBytes = lines*vga->_screenWidth;
+            memcpy(bbptr, pptr, copyBytes);
+        } else {
+            uint16_t* bbptr = (uint16_t*)bbuf;
+            bbptr += vga->_hBorder;
+            for (int i = 0; i < lines; i++) {
+                memcpy(bbptr, pptr, vga->_frameWidth);
+                bbptr += vga->_screenWidth;
+                pptr += vga->_frameWidth;
+            }
+        }
+        } else {
+        uint16_t* bbptr = bbuf;
+        bbptr += vga->_hBorder*vga->_frameScale;
+        lines = (len_bytes / (640 << 1)) >> 1;;
+        for (int y = 0; y < lines; y++) {
+            uint16_t* lineptr = bbptr;
+            for (int x = 0; x < vga->_frameWidth; x += 10) {
+                // partially unrolled loop for speed
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+            }
+            bbptr = lineptr + vga->_screenWidth;
+            memcpy(bbptr, lineptr, vga->_frameWidth*vga->_frameScale*2);
+            bbptr += vga->_screenWidth;
+        }            
+        
+        }
+    } else {
+    uint8_t* bbuf = (uint8_t*)bounce_buf;
+    bool skip = false;
+
+    //int div = vga->_frameScale * vga->_frameScale;
+    int pixelsPerByte = 1;
+    if (vga->_colorBits == 3) {
+        pixelsPerByte = 2;
+    } else if (vga->_colorBits == 1) {
+        pixelsPerByte = 8;
+    }
+
+    int screenLineIndex = pos_px / vga->_screenWidth;
+    int bufLineIndex = screenLineIndex / vga->_frameScale;
+
+    bufLineIndex -= vga->_vBorder;
+    if (bufLineIndex >= vga->_frameHeight) {
+        // past the bottom of the frame
+        memset(bounce_buf, 0, len_bytes);
+        if (pos_px >= vga->_lastBounceBufferPos) {
+            vga->swapBuffers();
+        }
+        return true;
+    }
+
+    if (bufLineIndex < 0) {
+        int lineAdj = (-bufLineIndex)*vga->_frameScale;
+        int pxAdj = lineAdj*vga->_screenWidth;
+        if (pxAdj >= len_bytes) {
+            // this buffer should be empty, before the first line of the frame
+            // clear
+            memset(bounce_buf, 0, len_bytes);
+            return true;
+        }
+
+        memset(bounce_buf, 0, pxAdj);
+        bbuf += pxAdj;
+        len_bytes -= pxAdj;
+        bufLineIndex = 0;
+    }
+
+    uint8_t* pptr = vga->_frameBuffers[vga->_frameBufferIndex] + (bufLineIndex*vga->_frameWidth/pixelsPerByte);
+    int screenLines = len_bytes / vga->_screenWidth;
+    int lines = screenLines / vga->_frameScale;
+
+    if (lines > (vga->_frameHeight-bufLineIndex)) {
+        int ll = vga->_frameHeight-bufLineIndex;
+        int clearLines = lines-ll;
+        lines = ll;
+
+        int screenClearIndex = lines * vga->_frameScale;
+        int screenClearLines = clearLines * vga->_frameScale;
+        uint8_t* clearPtr = bbuf + (screenClearIndex*vga->_screenWidth);
+        memset(clearPtr, 0, screenClearLines*vga->_screenWidth);
+    }
+
+    if (vga->_frameScale == 1 && vga->_colorBits == 8) {
+        // just copy the bytes
+        if (vga->_hBorder == 0 && vga->_vBorder == 0) {
+            uint8_t* bbptr = (uint8_t*)bbuf;
+            int copyBytes = lines*vga->_screenWidth;
+            memcpy(bbptr, pptr, copyBytes);
+        } else {
+            uint8_t* bbptr = (uint8_t*)bbuf;
+            bbptr += vga->_hBorder;
+            for (int i = 0; i < lines; i++) {
+                memcpy(bbptr, pptr, vga->_frameWidth);
+                bbptr += vga->_screenWidth;
+                pptr += vga->_frameWidth;
+            }
+        }
+    } else if (vga->_frameScale == 1 && vga->_colorBits == 3) {
+        uint8_t* bbptr = (uint8_t*)bbuf;
+        bbptr += vga->_hBorder;
+        uint8_t pixelBits;
+        for (int y = 0; y < lines; y++) {
+            uint8_t* lineptr = bbptr;
+            for (int x = 0; x < vga->_frameWidth; x += 10) {
+                // partially unrolled loop for speed
+                pixelBits = *pptr;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pixelBits >>= 4;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pptr++;
+                pixelBits = *pptr;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pixelBits >>= 4;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pptr++;
+                pixelBits = *pptr;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pixelBits >>= 4;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pptr++;
+                pixelBits = *pptr;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pixelBits >>= 4;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pptr++;
+                pixelBits = *pptr;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pixelBits >>= 4;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pptr++;
+            }
+            bbptr = lineptr + vga->_screenWidth;
+        }
+    } else if (vga->_frameScale == 2 && vga->_colorBits == 8) {
+        uint8_t* bbptr = bbuf;
+        bbptr += vga->_hBorder*vga->_frameScale;
+        for (int y = 0; y < lines; y++) {
+            uint8_t* lineptr = bbptr;
+            for (int x = 0; x < vga->_frameWidth; x += 10) {
+                // partially unrolled loop for speed
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+                *(bbptr++) = *pptr;
+                *(bbptr++) = *(pptr++);
+            }
+            bbptr = lineptr + vga->_screenWidth;
+            memcpy(bbptr, lineptr, vga->_frameWidth*vga->_frameScale);
+            bbptr += vga->_screenWidth;
+        }
+    } else if (vga->_frameScale == 2 && vga->_colorBits == 3) {
+        uint8_t* bbptr = bbuf;
+        bbptr += vga->_hBorder*vga->_frameScale;
+        uint8_t pixelBits;
+        for (int y = 0; y < lines; y++) {
+            uint8_t* lineptr = bbptr;
+            for (int x = 0; x < vga->_frameWidth; x += 10) {
+                // partially unrolled loop for speed
+                pixelBits = *pptr;
+                *(bbptr++) = pixelBits & 0b00000111;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pixelBits >>= 4;
+                *(bbptr++) = pixelBits & 0b00000111;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pptr++;
+                pixelBits = *pptr;
+                *(bbptr++) = pixelBits & 0b00000111;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pixelBits >>= 4;
+                *(bbptr++) = pixelBits & 0b00000111;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pptr++;
+                pixelBits = *pptr;
+                *(bbptr++) = pixelBits & 0b00000111;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pixelBits >>= 4;
+                *(bbptr++) = pixelBits & 0b00000111;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pptr++;
+                pixelBits = *pptr;
+                *(bbptr++) = pixelBits & 0b00000111;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pixelBits >>= 4;
+                *(bbptr++) = pixelBits & 0b00000111;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pptr++;
+                pixelBits = *pptr;
+                *(bbptr++) = pixelBits & 0b00000111;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pixelBits >>= 4;
+                *(bbptr++) = pixelBits & 0b00000111;
+                *(bbptr++) = pixelBits & 0b00000111;
+                pptr++;
+            }
+            bbptr = lineptr + vga->_screenWidth;
+            memcpy(bbptr, lineptr, vga->_frameWidth*vga->_frameScale);
+            bbptr += vga->_screenWidth;
+        }
+    } else if (vga->_colorBits == 1 && vga->_frameScale == 1) {
+        uint8_t* bbptr = bbuf;
+        bbptr += vga->_hBorder*vga->_frameScale;
+        uint8_t pixelBits;
+        for (int y = 0; y < lines; y++) {
+            uint8_t* lineptr = bbptr;
+            for (int x = 0; x < vga->_frameWidth; x += 8) {
+                // partially unrolled loop for speed
+                pixelBits = *pptr;
+                bbptr += 8;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pptr++;
+                bbptr += 8;
+            }
+            
+            bbptr = lineptr + vga->_screenWidth;
+        }
+    } else if (vga->_colorBits == 1 && vga->_frameScale == 2) {
+        uint8_t* bbptr = bbuf;
+        bbptr += vga->_hBorder*vga->_frameScale;
+        uint8_t pixelBits;
+        for (int y = 0; y < lines; y++) {
+            uint8_t* lineptr = bbptr;
+            for (int x = 0; x < vga->_frameWidth; x += 8) {
+                // partially unrolled loop for speed
+                pixelBits = *pptr;
+                bbptr += 16;
+                *(--bbptr) = pixelBits & 0b00000001;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pixelBits >>= 1;
+                *(--bbptr) = pixelBits & 0b00000001;
+                *(--bbptr) = pixelBits & 0b00000001;
+                pptr++;
+                bbptr += 16;
+            }
+            
+            bbptr = lineptr + vga->_screenWidth;
+            memcpy(bbptr, lineptr, vga->_frameWidth*vga->_frameScale);
+            bbptr += vga->_screenWidth;
+        }
+    }
+    }
+
+    if (pos_px >= vga->_lastBounceBufferPos && vga->_dBuff) {
+        vga->swapBuffers();
+    }
+
+    return true;
+}
+
+
+
+
+/*
+#include "VGA_esp32s3.h"
+#include "VGA_Pins.h"
+#include <Arduino.h>
+#include <esp_lcd_panel_ops.h>
+
+VGA_esp32s3::VGA_esp32s3() {
+    Serial.begin(115200);
+}
+
+VGA_esp32s3::~VGA_esp32s3() {}
+
+void VGA_esp32s3::init(int scrWidth, int scrHeight, int colorBits, int dBuff, bool psRam) {
+    if (!((scrWidth == 640 && scrHeight == 480 && (colorBits == 8 || colorBits == 16)) ||
+          (scrWidth == 320 && scrHeight == 240 && (colorBits == 8 || colorBits == 16))))
+    return;
+
+//Screen configuration-------------------------------------------------------------------
+    Serial.println();
+    Serial.println("------------------------------------------");
+    Serial.println("Start configuration...");
+    _psRam = psRam;
+    _dBuff = dBuff;
+    _scrWidth = scrWidth;
+    _scrHeight = scrHeight;
+    _scrColorBits = colorBits;
+    _scrBytesPerPixel = (_scrColorBits == 16) ? 2 : 1;
+    _scrSize = _scrWidth * _scrHeight * _scrBytesPerPixel;
+
+    _bounceBufferLines = 480 / 10;
+    _lastBounceBufferPos = 640 * (480 - _bounceBufferLines);
+    int pixelClockHz = 25000000;
+    int memSize = (_dBuff) ? _scrSize << 1 : _scrSize;
+
+//----------------------------------------------------------------------------------------
+    Serial.print((_psRam) ? "Use: PsRam, " : "Use Ram, "); 
+    Serial.print((_dBuff) ? "duoble buffer, " : "one buffer, ");       
+    Serial.printf("Screen resolution: %dx%dx%d\n", _scrWidth, _scrHeight, _scrColorBits);
+    Serial.printf("Memory need: %d bytes\n", memSize);
+    Serial.println();
+//----------------------------------------------------------------------------------------
+
+//Create semaphores-----------------------------------------------------------------------
+	ESP_LOGI(TAG, "Create semaphores");
+    _sem_vsync_end = xSemaphoreCreateBinary();
+    assert(_sem_vsync_end);
+    _sem_gui_ready = xSemaphoreCreateBinary();
+    assert(_sem_gui_ready);
+
+	ESP_LOGI(TAG, "Install RGB LCD panel driver");
+    esp_lcd_rgb_panel_config_t panel_config;
+    memset(&panel_config, 0, sizeof(esp_lcd_rgb_panel_config_t));
+//----------------------------------------------------------------------------------------
+
+    panel_config.data_width = 8;//+
+    panel_config.psram_trans_align = 64,
+    panel_config.num_fbs = 0;//+
+    panel_config.clk_src = LCD_CLK_SRC_PLL240M;//+
+    panel_config.bounce_buffer_size_px = _bounceBufferLines * _scrWidth;
+    panel_config.disp_gpio_num = -1;//+
+    
+    panel_config.pclk_gpio_num = VGA_PIN_NUM_PCLK;//+
+    panel_config.vsync_gpio_num = VGA_PIN_NUM_VSYNC;//+
+    panel_config.hsync_gpio_num = VGA_PIN_NUM_HSYNC;//+
+    panel_config.de_gpio_num = VGA_PIN_NUM_DE;//+
+
+// Настраиваем GPIO для 16-битного или 8-битного режима
+    if (_scrColorBits == 16) {
+        panel_config.data_gpio_nums[0]  = VGA_PIN_NUM_DATA11;
+        panel_config.data_gpio_nums[1]  = VGA_PIN_NUM_DATA12;
+        panel_config.data_gpio_nums[2]  = VGA_PIN_NUM_DATA13;
+        panel_config.data_gpio_nums[3]  = VGA_PIN_NUM_DATA14;
+        panel_config.data_gpio_nums[4]  = VGA_PIN_NUM_DATA15;
+        panel_config.data_gpio_nums[5]  = VGA_PIN_NUM_DATA5;
+        panel_config.data_gpio_nums[6]  = VGA_PIN_NUM_DATA6;
+        panel_config.data_gpio_nums[7]  = VGA_PIN_NUM_DATA7;
+        panel_config.data_gpio_nums[8]  = VGA_PIN_NUM_DATA8;
+        panel_config.data_gpio_nums[9]  = VGA_PIN_NUM_DATA9;
+        panel_config.data_gpio_nums[10] = VGA_PIN_NUM_DATA10;
+        panel_config.data_gpio_nums[11] = VGA_PIN_NUM_DATA0;
+        panel_config.data_gpio_nums[12] = VGA_PIN_NUM_DATA1;
+        panel_config.data_gpio_nums[13] = VGA_PIN_NUM_DATA2;
+        panel_config.data_gpio_nums[14] = VGA_PIN_NUM_DATA3;
+        panel_config.data_gpio_nums[15] = VGA_PIN_NUM_DATA4;
+    } else {
+        panel_config.data_gpio_nums[0] = VGA_PIN_NUM_DATA14;
+        panel_config.data_gpio_nums[1] = VGA_PIN_NUM_DATA15;
+        panel_config.data_gpio_nums[2] = VGA_PIN_NUM_DATA8;
+        panel_config.data_gpio_nums[3] = VGA_PIN_NUM_DATA9;
+        panel_config.data_gpio_nums[4] = VGA_PIN_NUM_DATA10;
+        panel_config.data_gpio_nums[5] = VGA_PIN_NUM_DATA2;
+        panel_config.data_gpio_nums[6] = VGA_PIN_NUM_DATA3;
+        panel_config.data_gpio_nums[7] = VGA_PIN_NUM_DATA4;
+    }
+
+    panel_config.timings.pclk_hz = pixelClockHz;//+
+    panel_config.timings.h_res = _scrWidth;//+
+    panel_config.timings.v_res = _scrHeight;//+   
+
+    //640x480
+    panel_config.timings.hsync_back_porch = 48;//+
+    panel_config.timings.hsync_front_porch = 16;//+
+    panel_config.timings.hsync_pulse_width = 96;//+
+    panel_config.timings.vsync_back_porch = 33;//+
+    panel_config.timings.vsync_front_porch = 10;//+
+    panel_config.timings.vsync_pulse_width = 2;//+     
+
+    panel_config.timings.flags.pclk_active_neg = true;//+
+    panel_config.timings.flags.hsync_idle_low = 0;//+
+    panel_config.timings.flags.vsync_idle_low = 0;//+
+
+    panel_config.flags.fb_in_psram = 0;//+
+    panel_config.flags.double_fb = 0;//+
+    panel_config.flags.no_fb = 1;//+
+
+    ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_config, &_panel_handle));
+
+//Get memory for buffers------------------------------------------------------------------
+    // Выделяем память под буферы
+    Serial.println("Total memory:"); 
+    Serial.printf("  Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    Serial.printf("  Free RAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    Serial.println();
+
+    for (int i = 0; i < 2; i++) {
+        if (_psRam) {
+             ESP_LOGI(TAG, "allocating in spi ram");
+            _scrBuffers[i] = (uint8_t*)heap_caps_malloc(_scrSize, MALLOC_CAP_SPIRAM);
+        } else {
+             ESP_LOGI(TAG, "allocating in main memory");
+            _scrBuffers[i] = (uint8_t*)malloc(_scrSize);
+        }
+        assert(_scrBuffers[i]);
+    }
+
+    memset(_scrBuffers[0], 255, _scrSize);
+    memset(_scrBuffers[1], 255, _scrSize);
+//----------------------------------------------------------------------------------------
+
+    _lastBounceBufferPos = _scrWidth*(_scrHeight-_bounceBufferLines);
+
+    ESP_LOGI(TAG, "Register event callbacks");
+    esp_lcd_rgb_panel_event_callbacks_t cbs = {
+    	.on_vsync = vsyncEvent,
+        .on_bounce_empty = bounceEvent,
+    };
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(_panel_handle, &cbs, this));
+
+    ESP_LOGI(TAG, "Initialize RGB LCD panel");
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(_panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(_panel_handle));
+    ESP_LOGI(TAG, "Init complete");
+/*
+// Конфигурация I2S для VGA---------------------------------------------------------------
+    esp_lcd_rgb_panel_config_t panel_config;
+    memset(&panel_config, 0, sizeof(esp_lcd_rgb_panel_config_t));
+
+// Настраиваем GPIO для 16-битного или 8-битного режима
+    if (_scrColorBits == 16) {
+        panel_config.data_gpio_nums[0]  = VGA_PIN_NUM_DATA11;
+        panel_config.data_gpio_nums[1]  = VGA_PIN_NUM_DATA12;
+        panel_config.data_gpio_nums[2]  = VGA_PIN_NUM_DATA13;
+        panel_config.data_gpio_nums[3]  = VGA_PIN_NUM_DATA14;
+        panel_config.data_gpio_nums[4]  = VGA_PIN_NUM_DATA15;
+        panel_config.data_gpio_nums[5]  = VGA_PIN_NUM_DATA5;
+        panel_config.data_gpio_nums[6]  = VGA_PIN_NUM_DATA6;
+        panel_config.data_gpio_nums[7]  = VGA_PIN_NUM_DATA7;
+        panel_config.data_gpio_nums[8]  = VGA_PIN_NUM_DATA8;
+        panel_config.data_gpio_nums[9]  = VGA_PIN_NUM_DATA9;
+        panel_config.data_gpio_nums[10] = VGA_PIN_NUM_DATA10;
+        panel_config.data_gpio_nums[11] = VGA_PIN_NUM_DATA0;
+        panel_config.data_gpio_nums[12] = VGA_PIN_NUM_DATA1;
+        panel_config.data_gpio_nums[13] = VGA_PIN_NUM_DATA2;
+        panel_config.data_gpio_nums[14] = VGA_PIN_NUM_DATA3;
+        panel_config.data_gpio_nums[15] = VGA_PIN_NUM_DATA4;
+    } else {
+        panel_config.data_gpio_nums[0] = VGA_PIN_NUM_DATA14;
+        panel_config.data_gpio_nums[1] = VGA_PIN_NUM_DATA15;
+        panel_config.data_gpio_nums[2] = VGA_PIN_NUM_DATA8;
+        panel_config.data_gpio_nums[3] = VGA_PIN_NUM_DATA9;
+        panel_config.data_gpio_nums[4] = VGA_PIN_NUM_DATA10;
+        panel_config.data_gpio_nums[5] = VGA_PIN_NUM_DATA2;
+        panel_config.data_gpio_nums[6] = VGA_PIN_NUM_DATA3;
+        panel_config.data_gpio_nums[7] = VGA_PIN_NUM_DATA4;
+    }
+    panel_config.disp_gpio_num = VGA_PIN_NUM_DISP; 
+    panel_config.pclk_gpio_num = VGA_PIN_NUM_PCLK; 
+    panel_config.vsync_gpio_num = VGA_PIN_NUM_VSYNC; 
+    panel_config.hsync_gpio_num = VGA_PIN_NUM_HSYNC; 
+    panel_config.de_gpio_num = VGA_PIN_NUM_DE; 
+
+    panel_config.timings.pclk_hz = 25000000;
+    panel_config.timings.h_res = 640;
+    panel_config.timings.v_res = 480;
+    panel_config.timings.hsync_back_porch = 48;
+    panel_config.timings.hsync_front_porch = 16;
+    panel_config.timings.hsync_pulse_width = 96;
+    panel_config.timings.vsync_back_porch = 33;
+    panel_config.timings.vsync_front_porch = 10;
+    panel_config.timings.vsync_pulse_width = 2;
+    panel_config.timings.flags.pclk_active_neg = true;
+    panel_config.timings.flags.hsync_idle_low = 0;
+    panel_config.timings.flags.vsync_idle_low = 0;
+
+    panel_config.data_width = (_scrColorBits == 16) ? 16 : 8;
+    panel_config.bits_per_pixel = panel_config.data_width;
+    panel_config.bounce_buffer_size_px = _buffLines * 640;
+    panel_config.psram_trans_align = 64;
+    panel_config.num_fbs = 0;
+    panel_config.clk_src = LCD_CLK_SRC_PLL240M;
+    panel_config.flags.fb_in_psram = 0;
+    panel_config.flags.double_fb = 0;
+    panel_config.flags.no_fb = 1;  
+    ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_config, &_panel_handle));  
+
+//Create semaphores-----------------------------------------------------------------------
+	ESP_LOGI(TAG, "Create semaphores");
+    _sem_vsync_end = xSemaphoreCreateBinary();
+    assert(_sem_vsync_end);
+    _sem_gui_ready = xSemaphoreCreateBinary();
+    assert(_sem_gui_ready);
+//----------------------------------------------------------------------------------------
+
+//Get memory for buffers------------------------------------------------------------------
+    // Выделяем память под буферы
+    Serial.println("Total memory:"); 
+    Serial.printf("  Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    Serial.printf("  Free RAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    Serial.println();
+
+    void** buffers = (_scrColorBits == 16) ? (void**)_scrBuffers16 : (void**)_scrBuffers;
+    int count = _dBuff ? 2 : 1;
+
+    for (int i = 0; i < count; i++) {
+        buffers[i] = _psRam ? (uint8_t*)heap_caps_malloc(_scrSize, MALLOC_CAP_SPIRAM) : 
+                              (uint8_t*)malloc(_scrSize);
+
+        assert(buffers[i]);
+        memset(buffers[i], 0, _scrSize);
+    }
+//----------------------------------------------------------------------------------------
+
+    ESP_LOGI(TAG, "Register event callbacks");
+    esp_lcd_rgb_panel_event_callbacks_t cbs = {
+    	.on_vsync = vsyncEvent,
+        .on_bounce_empty = bounceEvent,
+    };
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(_panel_handle, &cbs, this));
+
+    ESP_LOGI(TAG, "Initialize RGB LCD panel");
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(_panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(_panel_handle));
+    ESP_LOGI(TAG, "Init complete");
+//----------------------------------------------------------------------------------------
+
+    Serial.println("Free memory:");
+    Serial.printf("  Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    Serial.printf("  Free RAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    Serial.println("Init complete");
+    Serial.println("------------------------------------------");
+    if (!esp_ptr_dma_capable(getBuff16())) {
+        Serial.println("VRAM не поддерживает DMA!");
+    } else {
+        Serial.println("VRAM поддерживает DMA!");
+    }
+   
+}
+
+bool VGA_esp32s3::vsyncEvent(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx) {      
+	return true;
+}
+
+bool VGA_esp32s3::bounceEvent(esp_lcd_panel_handle_t panel, void* bounce_buf, int pos_px, int len_bytes, void* user_ctx) {
+	VGA_esp32s3* vga = (VGA_esp32s3*)user_ctx;
+    //delay(1);
+
+    //int yPos = pos_px / 640 / 2;
+    //int xPos = (pos_px % 640) / 2;
+    //int startPos = yPos * 320 + xPos;
+    //int startPos = (pos_px / 640 / 2) * 320 + (pos_px % 640 / 2);
+    int startPos = (vga->_scrWidth == 640) ? pos_px : pos_px >> 2;
+    if ((pos_px % 640) !=0) startPos +=6;
+
+    // Выбор типа буфера (16-бит или 8-бит)
+    void* bbuf = (vga->_scrColorBits == 16) ? (void*)(uint16_t*)bounce_buf : (void*)(uint8_t*)bounce_buf;
+    void* sour = (vga->_scrColorBits == 16)
+        ? (void*)&vga->_scrBuffers16[vga->_scrBufferIndex][startPos]
+        : (void*)&vga->_scrBuffers[vga->_scrBufferIndex][startPos];
+    //*((uint8_t)bbuf) = *((uint8_t)sour);
+
+    if (vga->_scrWidth == 640 && vga->_scrHeight == 480){
+        memcpy(bbuf, sour, len_bytes);
+    } else if (vga->_scrWidth == 320 && vga->_scrHeight == 240){
+        if (vga->_scrColorBits == 16){
+            uint16_t* _bbuf = static_cast<uint16_t*>(bbuf);
+            uint16_t* _sour = static_cast<uint16_t*>(sour);
+            uint16_t* savePos = nullptr;
+
+            int lines = (len_bytes / (640 * 2)) >> 1; // Делим на 2, так как 16-битные пиксели
+
+            for (int y = 0; y < lines; y++) {
+                savePos = _bbuf; // Сохраняем начальное положение
+
+                for (int x = 0; x < vga->_scrWidth; x += 10) {
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                }
+
+                memcpy(_bbuf, savePos, 640 << 1); // Копируем строку, 640 пикселей * 2 байта на пиксель
+                _bbuf += 640;  
+            }
+        } else if (vga->_scrColorBits == 8){
+            uint8_t* _bbuf = static_cast<uint8_t*>(bbuf);
+            uint8_t* _sour = static_cast<uint8_t*>(sour);
+            uint8_t* savePos = nullptr;
+
+            int lines = (len_bytes / 640) >> 1;
+
+            for (int y = 0; y < lines; y++){
+                savePos = _bbuf;
+                for (int x = 0; x < vga->_scrWidth; x +=10){
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                    *(_bbuf++) = *_sour; *(_bbuf++) = *(_sour++);
+                }  
+
+                memcpy(_bbuf, savePos, 640);
+                _bbuf += 640;   
+            }
+        }
+    }
+
+    if (pos_px <= vga->_lastBounceBufferPos && vga->_dBuff) {
+        vga->swapBuffers();
+    }
+
+    return true;
+}
+
+void VGA_esp32s3::vsyncWait() {
+    if (_dBuff){
+        xSemaphoreGive(_sem_gui_ready);
+        xSemaphoreTake(_sem_vsync_end, portMAX_DELAY);
+    }
+}
+
+void VGA_esp32s3::swapBuffers() {
+    if (xSemaphoreTakeFromISR(_sem_gui_ready, NULL) == pdTRUE) {
+        if (_scrBufferIndex == 0) {
+            _scrBufferIndex = 1;
+        } else {
+            _scrBufferIndex = 0;
+        }
+        xSemaphoreGiveFromISR(_sem_vsync_end, NULL);
+    }
+}
+
+uint8_t* VGA_esp32s3::getBuff() {
+    if (_dBuff){
+        if (_scrBufferIndex == 0){
+            return _scrBuffers[1];
+        } else {
+            return _scrBuffers[0];
+        }
+    } else {
+        return _scrBuffers[0];
+    }
+}
+
+
+uint16_t* VGA_esp32s3::getBuff16(){
+    if (_dBuff){
+        if (_scrBufferIndex == 0){
+            return _scrBuffers16[1];
+        } else {
+            return _scrBuffers16[0];
+        }
+    } else {
+        return _scrBuffers16[0];
+    }
+}
+
+/*
+    // Выбор типа буфера (16-бит или 8-бит)
+    void* bbuf = (vga->_scrColorBits == 16) ? (void*)(uint16_t*)bounce_buf : (void*)(uint8_t*)bounce_buf;
+    void* sour = (vga->_scrColorBits == 16)
+        ? (void*)&vga->_scrBuffers16[vga->_scrBufferIndex][pos_px]
+        : (void*)&vga->_scrBuffers[vga->_scrBufferIndex][startPos];
+    *((uint8_t)bbuf) = *((uint8_t)sour);
+/*
+    // Копирование данных
+std::copy(reinterpret_cast<uint8_t*>(sour), 
+          reinterpret_cast<uint8_t*>(sour) + len_bytes, 
+          reinterpret_cast<uint8_t*>(bbuf));
+
+#include "driver/i2c.h"
+
+#define I2C_MASTER_SCL_IO    22               /*!< gpio number for I2C master clock 
+#define I2C_MASTER_SDA_IO    21               /*!< gpio number for I2C master data  
+#define I2C_MASTER_NUM        I2C_NUM_0        /*!< I2C port number for master dev 
+#define I2C_MASTER_FREQ_HZ    100000          /*!< I2C master clock frequency 
+#define I2C_MASTER_TX_BUF_DISABLE   0         /*!< I2C master does not need buffer 
+#define I2C_MASTER_RX_BUF_DISABLE   0         /*!< I2C master does not need buffer 
+#define I2C_MASTER_ACK 0x0
+#define I2C_MASTER_NACK 0x1
+
+// Буфер для передачи
+uint8_t *i2c_buffer;
+int i2c_buffer_size = 256; // Размер буфера
+
+void i2c_master_init() {
+    i2c_config_t conf;
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = I2C_MASTER_SDA_IO;
+    conf.scl_io_num = I2C_MASTER_SCL_IO;
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.master.clk_speed = I2C_MASTER_FREQ_HZ;
+    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_NUM, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0));
+}
+
+// DMA передача через I2C (моделируем с использованием i2c_master_write())
+esp_err_t i2c_master_dma_send(uint8_t *data, size_t len) {
+    esp_err_t ret;
+
+    // Настройка DMA
+    // В стандартной библиотеке ESP32 нет прямой функции для DMA через I2C, но можно использовать прямую передачу данных через i2c_master_write.
+    ret = i2c_master_write_to_device(I2C_MASTER_NUM, 0x50, data, len, 1000 / portTICK_RATE_MS);  // 0x50 — адрес устройства
+
+    return ret;
+}
+
+bool VGA_DMA_I2C::bounceEvent(esp_lcd_panel_handle_t panel, void* bounce_buf, int pos_px, int len_bytes, void* user_ctx) {
+    VGA_DMA_I2C* vga = (VGA_DMA_I2C*)user_ctx;
+
+    // Передаем данные через I2C с использованием DMA (или просто через i2c_master_write)
+    esp_err_t ret = i2c_master_dma_send((uint8_t*)bounce_buf, len_bytes);
+    if (ret != ESP_OK) {
+        printf("Ошибка передачи данных через I2C\n");
+        return false;
+    }
+
+    return true;
+}
+
+
+    if (_psRam){
+        if (_dBuff){
+            if (_scrColorBits == 16){
+                _scrBuffers16[0] = _heap_caps_malloc(_scrSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+                _scrBuffers16[1] = _heap_caps_malloc(_scrSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+                assert(_scrBuffers16[0]);
+                memset(_scrBuffers16[0], 0, _scrSize);
+                assert(_scrBuffers16[1]);
+                memset(_scrBuffers16[1], 0, _scrSize);            
+            } else {
+                _scrBuffers[0] = _heap_caps_malloc(_scrSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+                _scrBuffers[1] = _heap_caps_malloc(_scrSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+                assert(_scrBuffers[0]);
+                memset(_scrBuffers[0], 0, _scrSize);            
+                assert(_scrBuffers[1]);
+                memset(_scrBuffers[1], 0, _scrSize);            
+            }
+        } else {
+            if (_scrColorBits == 16){
+                _scrBuffers16[0] = _heap_caps_malloc(_scrSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+                assert(_scrBuffers16[0]);
+                memset(_scrBuffers16[0], 0, _scrSize);
+            } else {
+                _scrBuffers[0] = _heap_caps_malloc(_scrSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+                assert(_scrBuffers[0]);
+                memset(_scrBuffers[0], 0, _scrSize);
+            }
+        }
+    } else {
+        if (_dBuff){
+            if (_scrColorBits == 16){
+                _scrBuffers16[0] = malloc(_scrSize);
+                _scrBuffers16[1] = malloc(_scrSize);
+                assert(_scrBuffers16[0]);
+                memset(_scrBuffers16[0], 0, _scrSize);
+                assert(_scrBuffers16[1]);
+                memset(_scrBuffers16[1], 0, _scrSize);                  
+            } else {
+                _scrBuffers[0] = malloc(_scrSize);
+                _scrBuffers[1] = malloc(_scrSize);
+                assert(_scrBuffers[0]);
+                memset(_scrBuffers[0], 0, _scrSize);            
+                assert(_scrBuffers[1]);
+                memset(_scrBuffers[1], 0, _scrSize);                  
+            }
+        } else {
+            if (_scrColorBits == 16){
+                _scrBuffers16[0] = malloc(_scrSize);
+                assert(_scrBuffers16[0]);
+                memset(_scrBuffers16[0], 0, _scrSize);                
+            } else {
+                _scrBuffers[0] = malloc(_scrSize);
+                assert(_scrBuffers[0]);
+                memset(_scrBuffers[0], 0, _scrSize);                 
+            }           
+        }
+    }
+
+dma------------------------------------------------------------------
+esp_err_t initI2SDMA() {
+    // I2S конфигурация
+    i2s_config_t i2s_config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_TX,           // Режим мастер, передача данных
+        .sample_rate = 25000000,                        // Частота пикселей
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,    // 16 бит на пиксель (если используешь 16 бит)
+        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,    // Стерео или моно
+        .communication_format = I2S_COMM_FORMAT_I2S_MSB, // MSB формат
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,        // Прерывания
+        .dma_buf_count = 4,                             // Количество DMA буферов
+        .dma_buf_len = 1024                             // Размер каждого DMA буфера
+    };
+
+    // Конфигурация шины I2S (для вывода данных на VGA)
+    i2s_pin_config_t pin_config = {
+        .ws_io_num = VGA_PIN_NUM_VSYNC,   // Синхронизация
+        .bck_io_num = VGA_PIN_NUM_PCLK,   // Тактирование
+        .data_out_num = VGA_PIN_NUM_DATA0 // Данные
+    };
+
+    // Инициализация I2S с выбранной конфигурацией
+    ESP_ERROR_CHECK(i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL));
+    ESP_ERROR_CHECK(i2s_set_pin(I2S_NUM_0, &pin_config));
+
+    return ESP_OK;
+}
+
+void VGA_DMA_I2C::fillRectWithI2SDMA(int x1, int y1, int x2, int y2, uint16_t col) {
+    if (x2 < x1) swap(x1, x2);
+    if (y2 < y1) swap(y1, y2);
+    if (x1 > _vX2 || y1 > _vY2 || x2 < _vX1 || y2 < _vY1) return;
+
+    x1 = max(_vX1, x1);
+    x2 = min(_vX2, x2);
+    y1 = max(_vY1, y1);
+    y2 = min(_vY2, y2);
+    int size = x2 - x1 + 1;
+    int lines = y2 - y1 + 1;
+
+    // Выделяем DMA буфер
+    uint16_t* dma_buff = (uint16_t*)heap_caps_malloc(size * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if (!dma_buff) return;  // Проверка на выделение памяти
+
+    // Заполняем буфер значением цвета
+    for (int i = 0; i < size; i++) {
+        dma_buff[i] = col;
+    }
+
+    // Отправка данных с помощью I2S DMA
+    while (lines-- > 0) {
+        // Загружаем данные в буфер I2S для передачи
+        i2s_write_bytes(I2S_NUM_0, (const char*)dma_buff, size * sizeof(uint16_t), portMAX_DELAY);
+        // Переходим к следующей строке
+        dma_buff += _scrWidth;
+    }
+
+    // Освобождаем память
+    heap_caps_free(dma_buff);
+}
+
+*/
