@@ -1,4 +1,6 @@
 #pragma once
+
+#include <Arduino.h>
 #include <esp_lcd_panel_rgb.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -12,9 +14,9 @@ class VGA_esp32s3{
 	    bool initWithSize(int frameWidth, int frameHeight, int bits, bool dBuff = true);
     	bool init(int width, int height, int scale = 2, int hborder = 0, int yborder = 0, int bits = 8, int* pins = NULL, bool usePsram = true);
 	    bool deinit();
-        //void setViewport(int x1, int x2, int y1, int y2);
+        void setViewport(int x1, int x2, int y1, int y2);
 
-	    void vsyncWait();        
+	    void swap();        
 	    uint8_t* getDrawBuffer();
 		uint16_t* getDrawBuffer16();
 
@@ -22,6 +24,7 @@ class VGA_esp32s3{
 	    int frameHeight(){return _frameHeight;}
 	    int getColorBits(){return _colorBits;}
 		int getBytesPerPixel(){return _bytePerPixel;}
+		int getMaxCol(){return _maxCol;}
 
         int getvX1(){return _vX1;}
         int getvX2(){return _vX2;}
@@ -37,32 +40,33 @@ class VGA_esp32s3{
 	    SemaphoreHandle_t _sem_vsync_end;
 	    SemaphoreHandle_t _sem_gui_ready;
 	    esp_lcd_panel_handle_t _panel_handle = NULL;
-	    
-		uint8_t *_frameBuffers[2];
-		uint16_t *_frameBuffers16[2];
+
+		uint8_t *_frameBuffers[2] = {nullptr, nullptr};
+		uint16_t *_frameBuffers16[2] = {nullptr, nullptr};
 
 		bool _dBuff = true;
-	    int _frameBufferIndex = 0;
-	    int _frameWidth = 0;
-	    int _frameHeight = 0;
-	    int _screenWidth = 0;
-	    int _screenHeight = 0;
+	    int _frameBufferIndex;
+	    int _frameWidth;
+	    int _frameHeight;
+	    int _screenWidth;
+	    int _screenHeight;
 	    int _frameScale = 2;
 	    int _colorBits = 8;
 		int _bytePerPixel = 1;
-	    int _bounceBufferLines = 0;
-	    int _hBorder = 0;
-	    int _vBorder = 0;
-	    int _lastBounceBufferPos = 0;
+		int _maxCol;
+	    int _bounceBufferLines;
+	    int _hBorder;
+	    int _vBorder;
+	    int _lastBounceBufferPos;
 	    bool _frameBuffersInPsram = false;
 
-
-        int _vX1 = 0, 
-            _vY1 = 0, 
-            _vX2 = 0, 
-            _vY2 = 0, 
-            _vWidth = 0, 
-            _vHeight = 0;        
+		//Viewport
+        int _vX1, 
+            _vY1, 
+            _vX2, 
+            _vY2, 
+            _vWidth, 
+            _vHeight;        
 
 	    bool validConfig(int width, int height, int scale = 2, int hborder = 0, int yborder = 0, int bits = 8, int* pins = NULL, bool usePsram = false);
 	    static bool IRAM_ATTR vsyncEvent(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx);

@@ -29,10 +29,14 @@
 #define VGA_PIN_NUM_DISP_EN        -1
 #define VGA_PIN_NUM_DE             -1
 
+// note: PCLK pin is not needed for VGA output.
+// however, the current version of the esp lcd rgb driver requires this to be set
+// to keep this pin unused and available for something else, you need a patched version
+// of the driver (for now)
 #if PATCHED_LCD_DRIVER
-    #define VGA_PIN_NUM_PCLK       -1
+#define VGA_PIN_NUM_PCLK           -1
 #else
-    #define VGA_PIN_NUM_PCLK       -1//21
+#define VGA_PIN_NUM_PCLK           -1//21
 #endif
 //End LCD connect pins ----------------------------------------------------------------------------------------------------
 /*

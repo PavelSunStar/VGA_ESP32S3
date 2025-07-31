@@ -2,66 +2,39 @@
 #include "VGA_esp32s3.h"
 #include <esp_log.h>
 #include <esp_lcd_panel_ops.h>
-#include <string.h>
 #include "VGA_Pins.h"
-#include "VGA_Math.h"
-
-// default pin values chosen to avoid conflicting with spi, i2c, or serial.
-
-#define VGA_PIN_NUM_HSYNC          1
-#define VGA_PIN_NUM_VSYNC          2
-#define VGA_PIN_NUM_DE             -1
-
-// note: PCLK pin is not needed for VGA output.
-// however, the current version of the esp lcd rgb driver requires this to be set
-// to keep this pin unused and available for something else, you need a patched version
-// of the driver (for now)
-#if PATCHED_LCD_DRIVER
-#define VGA_PIN_NUM_PCLK           -1
-#else
-#define VGA_PIN_NUM_PCLK           -1//21
-#endif
-
-/*
-#define VGA_PIN_NUM_DATA0          14
-#define VGA_PIN_NUM_DATA1          15
-#define VGA_PIN_NUM_DATA2          8
-#define VGA_PIN_NUM_DATA3          9
-#define VGA_PIN_NUM_DATA4          10
-#define VGA_PIN_NUM_DATA5          2
-#define VGA_PIN_NUM_DATA6          3
-#define VGA_PIN_NUM_DATA7          4
-*/
-#define VGA_PIN_NUM_DISP_EN        -1
 
 static const char *TAG = "vga";
 
 VGA_esp32s3::VGA_esp32s3() {
     // Код конструктора: здесь можно инициализировать переменные или выделить ресурсы
     Serial.begin(115200);
-    Serial.println("VGA_esp32s3 constructor called.");
 }
 
 VGA_esp32s3::~VGA_esp32s3() {
     // Код деструктора: здесь можно освободить ресурсы, закрыть соединения и т.д.
-    Serial.println("VGA_esp32s3 destructor called.");
 }
 
-/*
-void VGA_esp32s3::setViewport(int x1, int x2, int y1, int y2){
-    if (x1 > x2) swap(x1, x2);
-    if (y1 > y2) swap(y1, y2);
-    if (x1 < 0) x1 = 0; if (x2 > _frameWidth - 1) x2 = _frameWidth - 1;
-    if (y1 < 0) y1 = 0; if (y2 > _frameHeight - 1) x2 = _frameHeight - 1;
+
+void VGA_esp32s3::setViewport(int x1, int y1, int x2, int y2) {
+    if (x1 > x2) std::swap(x1, x2);
+    if (y1 > y2) std::swap(y1, y2);
+
+    if (x1 < 0) x1 = 0;
+    if (x2 > _frameWidth - 1) x2 = _frameWidth - 1;
+
+    if (y1 < 0) y1 = 0;
+    if (y2 > _frameHeight - 1) y2 = _frameHeight - 1;
 
     _vX1 = x1;
     _vY1 = y1;
     _vX2 = x2;
     _vY2 = y2;
-    _vWidth = x2 - x1 + 1;
-    _vHeight = y2 - y1 + 1;
+
+    _vWidth = _vX2 - _vX1 + 1;
+    _vHeight = _vY2 - _vY1 + 1;
 }
-*/
+
 
 bool VGA_esp32s3::initWithSize(int frameWidth, int frameHeight, int bits, bool dBuff) {
     int hborder = 9999;
@@ -122,6 +95,13 @@ bool VGA_esp32s3::initWithSize(int frameWidth, int frameHeight, int bits, bool d
 
     if (init(screenWidth, screenHeight, scale, hborder, vborder, bits, NULL, true)){
         _dBuff = dBuff;
+        setViewport(0, 0, frameWidth - 1, frameHeight - 1);
+
+        Serial.printf("[Screen resolution]: %dx%dx%d, %s\n", _frameWidth, _frameHeight, _maxCol, _dBuff ? "double buffer" : "one buffer");
+        int memSize = _frameWidth * _frameHeight * _bytePerPixel * ((_dBuff) ? 2 : 1);
+        Serial.printf("[Memory usage]: %d bytes\n", memSize);
+        Serial.println();
+
         return true;
     }    
 
@@ -159,13 +139,6 @@ bool VGA_esp32s3::init(int width, int height, int scale, int hborder, int vborde
 	_frameWidth = width / _frameScale;
 	_frameHeight = height / _frameScale;
 
-    //set viewport
-    _vX1 = 0; _vY1 = 0; 
-    _vX2 = _frameWidth - 1;
-    _vY2 = _frameHeight - 1;
-    _vWidth = _vX2 - _vX1 + 1;
-    _vHeight = _vY2 - _vY1 + 1;
-
     _hBorder = hborder;
     _frameWidth -= (2*_hBorder);
 
@@ -175,6 +148,7 @@ bool VGA_esp32s3::init(int width, int height, int scale, int hborder, int vborde
 	_screenWidth = width;
 	_screenHeight = height;
     _colorBits = bits;
+    _maxCol = 1 << _colorBits;
     _bytePerPixel = (_colorBits == 16) ? 2 : 1;
     _bounceBufferLines = height / 10;
 
@@ -389,7 +363,7 @@ bool VGA_esp32s3::deinit() {
     return true;
 }
 
-void VGA_esp32s3::vsyncWait() {
+void VGA_esp32s3::swap() {
 	// get draw semaphore
     if (_dBuff){
         xSemaphoreGive(_sem_gui_ready);

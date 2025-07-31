@@ -1,33 +1,72 @@
 #include <Arduino.h>
 #include "VGA_GFX.h"
-#include "VGA_Math.h"
-//#include "esp_heap_caps.h"  // Для выделения памяти в области DMA
-
 
 VGA_GFX::VGA_GFX(VGA_esp32s3& vga) : _vga(vga) {
-    // Конструктор, инициализация ссылки на объект VGA_esp32s3
-    initLUT();
+    // Конструктор, инициализация ссылки на объект VGA_esp32s3    
 }
 
 VGA_GFX::~VGA_GFX() {
     // Деструктор (если нужно освободить ресурсы)
 }
 
+void VGA_GFX::init(){
+    for (int i = 0; i < 600; i++) virtualY[i] = _vga.frameWidth() * i;
+}
+
 uint16_t VGA_GFX::getColor(uint8_t r, uint8_t g, uint8_t b) {
-    if (_vga.getColorBits() == 16) {
-        uint8_t rr = map(r, 0, 256, 0, 32);
-        uint8_t gg = map(g, 0, 256, 0, 64);
-        uint8_t bb = map(b, 0, 256, 0, 32);
-        return (rr << 11) | (gg << 5) | bb; // Вернём 16-битный цвет
-    } else if (_vga.getColorBits() == 8) {
-        uint8_t col = map(r, 0, 256, 0, 8) << 5;
-        col |= map(g, 0, 256, 0, 8) << 2;
-        col |= map(b, 0, 256, 0, 4);
-        return col; // Вернём 8-битный цвет
+    switch (_vga.getColorBits()) {
+    case 16:
+        return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3); // RGB565
+    case 8:
+        return ((r >> 5) << 5) | ((g >> 5) << 2) | (b >> 6); // RGB332
+    default:
+        return 0;
+    }
+}
+
+uint8_t VGA_GFX::bright8(uint8_t col, int8_t brightness) {
+    if (brightness == 0) return col;
+
+    uint8_t r = (col >> 5) & 0b111;
+    uint8_t g = (col >> 2) & 0b111;
+    uint8_t b =  col       & 0b11;
+
+    if (brightness > 0) {
+        // Осветляем — логика через __builtin_clz
+        uint8_t add = __builtin_clz((uint8_t)brightness) - 24;
+        r = (r + add > 7) ? 7 : r + add;
+        g = (g + add > 7) ? 7 : g + add;
+        b = (b + add > 3) ? 3 : b + add;
+    } else {
+        // Затемняем
+        uint8_t sub = __builtin_clz((uint8_t)(-brightness)) - 24;
+        r = (r < sub) ? 0 : r - sub;
+        g = (g < sub) ? 0 : g - sub;
+        b = (b < sub) ? 0 : b - sub;
     }
 
-    return 0; // Возвращаем 0, если ни один из режимов не подошёл
+    return (r << 5) | (g << 2) | b;
 }
+
+/*
+uint8_t VGA_GFX::setBrightness8(uint8_t col, int8_t brightness) {
+    if (brightness < 0x20) return col; // не трогаем
+
+    uint8_t r = (col >> 5) & 0b111;
+    uint8_t g = (col >> 2) & 0b111;
+    uint8_t b =  col       & 0b11;
+
+    int8_t bla;
+
+    // Осветляем
+    uint8_t add = __builtin_clz(brightness) - 24; // 32-битное число
+    r = (r + add > 7) ? 7 : r + add;
+    g = (g + add > 7) ? 7 : g + add;
+    b = (b + add > 3) ? 3 : b + add;
+
+    return (r << 5) | (g << 2) | b;
+}
+*/
 
 void VGA_GFX::cls(uint16_t col) { 
     if (_vga.getColorBits() == 16) {
@@ -56,53 +95,164 @@ void VGA_GFX::cls(uint16_t col) {
 void VGA_GFX::putPixel(int x, int y, uint16_t col) {
     if (x > _vga.getvX2() || y > _vga.getvY2() || x < _vga.getvX1() || y <_vga.getvY1()) return;
 
-    if (_vga.getColorBits() == 16) {
-        uint16_t* scr = &_vga.getDrawBuffer16()[_vga.frameWidth() * y + x];
+    int* fastY = (_vga.frameWidth() == 640) ? _math.fastY_640 : _math.fastY_320;
+    if (_vga.getColorBits() == 16){
+        uint16_t* scr = _vga.getDrawBuffer16() + fastY[y] + x;
         *scr = col;
-    } else if (_vga.getColorBits() == 8){
-        uint8_t* scr = &_vga.getDrawBuffer()[_vga.frameWidth() * y + x];
-        *scr = (uint8_t)col;
+    } else {
+        uint8_t* scr = _vga.getDrawBuffer() + fastY[y] + x;
+        *scr = (uint8_t)(col & 0xFF);
     }
 }
 
 void VGA_GFX::hLine(int x1, int y, int x2, uint16_t col){
     if (x2 < x1) std::swap(x1, x2);
-    if (x1 > _vga.getvX2() || y > _vga.getvY2() || x2 < _vga.getvX1() || y <_vga.getvY1()) return;   
 
-    if (x1 < _vga.getvX1()) x1 = _vga.getvX1();
-    if (x2 > _vga.getvX2()) x2 = _vga.getvX2();
+    int xx1 = _vga.getvX1();
+    int xx2 = _vga.getvX2();
+
+    if (x1 > xx2 || y > _vga.getvY2() || x2 < xx1 || y < _vga.getvY1()) return;   
+
+    x1 = std::max(x1, xx1);
+    x2 = std::min(x2, xx2);
     int size = x2 - x1 + 1;
+    int* fastY = (_vga.frameWidth() == 640) ? _math.fastY_640 : _math.fastY_320;
 
     if (_vga.getColorBits() == 16){
-        uint16_t* scr = &_vga.getDrawBuffer16()[_vga.frameWidth() * y + x1];
-        while (size-- > 0) *scr++ = col;         
-    } else if (_vga.getColorBits() == 8){
-        uint8_t* scr = &_vga.getDrawBuffer()[_vga.frameWidth() * y + x1]; 
-        memset(scr, (uint8_t)col, size);
-    }    
+        uint16_t* scr = _vga.getDrawBuffer16() + fastY[y] + x1; 
+        while (size-- > 0) *scr++ = col;                     
+    } else { 
+        uint8_t* scr = _vga.getDrawBuffer() + fastY[y] + x1;
+        memset(scr, col, size);                         
+    }        
 }
 
 void VGA_GFX::vLine(int x, int y1, int y2, uint16_t col){
     if (y2 < y1) std::swap(y1, y2);
-    if (x > _vga.getvX2() || y1 > _vga.getvY2() || x < _vga.getvX1() || y2 <_vga.getvY1()) return;    
 
-    if (y1 < _vga.getvY1()) y1 = _vga.getvY1();
-    if (y2 > _vga.getvY2()) y2 = _vga.getvY2();
-    int size = y2 - y1 + 1;
+    int yy1 = _vga.getvY1();
+    int yy2 = _vga.getvY2();
+
+    if (x > _vga.getvX2() || y1 > yy2 || x < _vga.getvX1() || y2 < yy1) return;    
+
+    y1 = std::max(y1, yy1);
+    y2 = std::min(y2, yy2);
+    int size = y2 - y1 + 1;    
+    int width = _vga.frameWidth();
+    int* fastY = (_vga.frameWidth() == 640) ? _math.fastY_640 : _math.fastY_320;
 
     if (_vga.getColorBits() == 16) {
-        uint16_t* scr = &_vga.getDrawBuffer16()[_vga.frameWidth() * y1 + x];
+        uint16_t* scr = _vga.getDrawBuffer16() + fastY[y1] + x;
         while (size-- > 0){
             *scr = col;
-            scr += _vga.frameWidth();
+            scr += width;
         }    
-    } else if (_vga.getColorBits() == 8){
-        uint8_t* scr = &_vga.getDrawBuffer()[_vga.frameWidth() * y1 + x];
+    } else {
+        uint8_t* scr = _vga.getDrawBuffer() + fastY[y1] + x;
+        uint8_t color = (uint8_t)(col & 0xFF);
+        
+
         while (size-- > 0){
-            *scr = (uint8_t)col;
-            scr += _vga.frameWidth();
-        }    
+            *scr = color;
+            scr += width;
+        }                
+    }           
+}
+
+void VGA_GFX::rect(int x1, int y1, int x2, int y2, uint16_t col){
+    if (x2 < x1) std::swap(x1, x2);
+    if (y2 < y1) std::swap(y1, y2);
+    
+    int xx1 = _vga.getvX1();
+    int yy1 = _vga.getvY1();
+    int xx2 = _vga.getvX2();
+    int yy2 = _vga.getvY2();
+
+    if (x1 > xx2 || y1 > yy2 || x2 < xx1 || y2 < yy1) return;
+
+    int size = x2 - x1;
+    int sizex = _vga.frameWidth();
+    int sizey = y2 - y1 - 1;
+    int skip = sizex - x2 + x1;
+
+    if ((x1 >=  xx1) && (y1 >= yy1) && (x2 <= xx2) && (y2 <= yy2)){        
+        switch (_vga.getColorBits()){
+            case 8:{
+                uint8_t* scr = _vga.getDrawBuffer();
+                scr += virtualY[y1];
+                scr += x1;
+                memset(scr, col, size + 1);                 
+                scr += sizex;
+                while (sizey-- > 0){
+                    *scr = col;
+                    scr += size;
+                    *scr = col;
+                    scr += skip;
+                }      
+                memset(scr, col, size + 1);               
+                break;
+            }  
+            case 16:{
+
+            }                     
+        }
+    } else {
+        hLine(x1, y1, x2, col);  // Верхняя граница
+        hLine(x1, y2, x2, col);  // Нижняя граница
+        vLine(x1, y1, y2, col);  // Левая граница
+        vLine(x2, y1, y2, col);  // Правая граница
     }    
+}
+
+void VGA_GFX::fillRect(int x1, int y1, int x2, int y2, uint16_t col) {
+    if (x2 < x1) std::swap(x1, x2); 
+    if (y2 < y1) std::swap(y1, y2);
+    
+    int xx1 = _vga.getvX1();
+    int yy1 = _vga.getvY1();
+    int xx2 = _vga.getvX2();
+    int yy2 = _vga.getvY2();
+
+    if (x1 > xx2 || y1 > yy2 || x2 < xx1 || y2 < yy1) return;
+
+    if (x1 < xx1) x1 = xx1;
+    if (y1 < yy1) y1 = yy1;    
+    if (x2 > xx2) x2 = xx2;
+    if (y2 > yy2) y2 = yy2;
+
+    int size = x2 - x1 + 1; 
+    int lines = y2 - y1 + 1;
+    int skip = _vga.frameWidth();
+
+    switch (_vga.getColorBits()){
+        case 8:{
+            uint8_t* scr = _vga.getDrawBuffer();
+            scr += virtualY[y1] + x1;
+            
+            while (lines-- > 0) {
+                memset(scr, col, size);
+                scr += skip;
+            }
+
+            break;
+        }
+
+        case 16:{
+            uint16_t* scr = &_vga.getDrawBuffer16()[_vga.frameWidth() * y1 + x1];
+            uint16_t* buff = (uint16_t*)heap_caps_malloc(size << 1, MALLOC_CAP_SPIRAM);
+            if (!buff) return;  // Проверка на выделение памяти
+
+            for (int x = 0; x < size; x++) buff[x] = col;
+
+            while (lines-- > 0) {
+                memcpy(scr, buff, size << 1);  // Копируем DMA-оптимизированным способом
+                scr += skip;
+            }
+
+            heap_caps_free(buff);  // Освобождаем память 
+            break;
+        }
+    }        
 }
 
 void VGA_GFX::line(int x1, int y1, int x2, int y2, uint16_t col){
@@ -122,22 +272,28 @@ void VGA_GFX::line(int x1, int y1, int x2, int y2, uint16_t col){
         // Инициализируем ошибку
         int err = dx - dy;   
 
+        int cb = _vga.getColorBits();
         uint16_t* scr16 = (uint16_t*)_vga.getDrawBuffer16();
         uint8_t* scr8 = _vga.getDrawBuffer();
         uint8_t* null8 = scr8;
         uint16_t* null16 = scr16;
 
+        int xx1 = _vga.getvX1();
+        int yy1 = _vga.getvY1();
+        int xx2 = _vga.getvX2();
+        int yy2 = _vga.getvY2();
+
         while (true) {
             // Проверяем, если текущий пиксель в пределах экрана
-            if (x1 >= _vga.getvX1() || x1 <= _vga.getvX2() || y1 < _vga.getvY1() || y1 <_vga.getvY2()){
-                int index = _vga.frameWidth() * y1 + x1;
+            if (x1 >= xx1 && x1 <= xx2 && y1 >= yy1 && y1 < yy2){
+                int index = virtualY[y1] + x1;                
 
-                if (_vga.getColorBits() == 16) {
+                if (cb == 16) {
                     scr16 = null16 + index;
                     *scr16 = col;
-                } else if (_vga.getColorBits() == 8) {
+                } else if (cb == 8) {
                     scr8 = null8 + index;
-                    *scr8 = (uint8_t)col;
+                    *scr8 = col;
                 }
             }
 
@@ -145,7 +301,7 @@ void VGA_GFX::line(int x1, int y1, int x2, int y2, uint16_t col){
             if (x1 == x2 && y1 == y2) break;
         
             // Вычисляем наибольшую ошибку и корректируем координаты
-            int e2 = err * 2;
+            int e2 = err << 1;
             if (e2 > -dy) {
                 err -= dy;
                 x1 += sx;
@@ -159,56 +315,9 @@ void VGA_GFX::line(int x1, int y1, int x2, int y2, uint16_t col){
 }
 
 void VGA_GFX::lineAngle(int x, int y, int len, int angle, uint16_t col){
-    if (len <= 0) return;
-
-    angle %= 360;
-    if (angle < 0) angle = 360 + angle;
-    int x1 = x + len * cosLUT[angle];
-    int y1 = y + len * sinLUT[angle];
-
+    int x1 = _math.xLUT(x, y, len, angle);
+    int y1 = _math.yLUT(x, y, len, angle);
     line(x, y, x1, y1, col);
-}
-
-void VGA_GFX::rect(int x1, int y1, int x2, int y2, uint16_t col){
-    hLine(x1, y1, x2, col);  // Верхняя граница
-    hLine(x1, y2, x2, col);  // Нижняя граница
-    vLine(x1, y1, y2, col);  // Левая граница
-    vLine(x2, y1, y2, col);  // Правая граница
-}
-
-void VGA_GFX::fillRect(int x1, int y1, int x2, int y2, uint16_t col) {
-    if (x2 < x1) std::swap(x1, x2); if (y2 < y1) std::swap(y1, y2);
-    if (x1 > _vga.getvX2() || y1 > _vga.getvY2() || x2 < _vga.getvX1() || y2 <_vga.getvY1()) return;
-
-    if (x1 < _vga.getvX1()) x1 = _vga.getvX1();
-    if (x2 > _vga.getvX2()) x2 = _vga.getvX2();
-    if (y1 < _vga.getvY1()) y1 = _vga.getvY1();
-    if (y2 > _vga.getvY2()) y2 = _vga.getvY2();
-
-    int size = x2 - x1 + 1; 
-    int lines = y2 - y1 + 1;
-    int skip = _vga.frameWidth();
-
-    if (_vga.getColorBits() == 16) {        
-        uint16_t* scr = &_vga.getDrawBuffer16()[_vga.frameWidth() * y1 + x1];
-        uint16_t* buff = (uint16_t*)heap_caps_malloc(size << 1, MALLOC_CAP_SPIRAM);
-        if (!buff) return;  // Проверка на выделение памяти
-
-        for (int x = 0; x < size; x++) buff[x] = col;
-
-        while (lines-- > 0) {
-            memcpy(scr, buff, size << 1);  // Копируем DMA-оптимизированным способом
-            scr += skip;
-        }
-
-        heap_caps_free(buff);  // Освобождаем память        
-    } else if (_vga.getColorBits() == 8) {
-        uint8_t* scr = &_vga.getDrawBuffer()[skip * y1 + x1];
-        while (lines-- > 0) {
-            memset(scr, (uint8_t)col, size);
-            scr += skip;
-        }
-    }
 }
 
 void VGA_GFX::triangle(int x1, int y1, int x2, int y2, int x3, int y3, uint16_t col){

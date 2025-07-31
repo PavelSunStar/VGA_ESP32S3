@@ -1,25 +1,22 @@
 #include <Arduino.h>
 #include "VGA_Sprite.h"
-#include "VGA_Math.h"
 #include <cstring> // Для memset
 
-#include <dspm_mult.h>  // SIMD-умножение матриц
-#include <dspm_matrix.h> // Операции с матрицами
-#include <dsps_mul.h>    // Умножение массивов
-#include <esp_dsp.h>
+//#include <dspm_mult.h>  // SIMD-умножение матриц
+//#include <dspm_matrix.h> // Операции с матрицами
+//#include <dsps_mul.h>    // Умножение массивов
+//#include <esp_dsp.h>
 
-// Конструкторы
 // Конструктор с передачей ссылки на VGA
 VGA_Sprite::VGA_Sprite(VGA_esp32s3& vga)
-    : _vga(vga),
-      _scrWidth(0), _scrHeight(0), 
-      _width(0), _height(0), _size(0),
-      _colorBits(0), _maskColor(0),
-      _img(nullptr), _img16(nullptr),
-      _bg(false), _created(false),
-      _offsetX(0), _offsetY(0) {
-    
-    initLUT();
+    :   _vga(vga),
+        //_scrWidth(0), _scrHeight(0),
+        _width(0), _height(0),
+        //_bit(0),
+        _created(false),
+        _img8(nullptr), _img16(nullptr)
+{
+
 }
 
 // Деструктор
@@ -27,6 +24,428 @@ VGA_Sprite::~VGA_Sprite() {
     destroy();
 }
 
+bool VGA_Sprite::allocateMemory(int x, int y) {
+    destroy();
+
+    _width = x;
+    _height = y;
+    int bit = _vga.getColorBits();
+    _size = _width * _height * ((bit == 16) ? 2 : 1);
+
+    if (bit == 16) {
+        _img16 = (uint16_t*)heap_caps_malloc(_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (_img16 == nullptr) return false;
+    } else {
+        _img8 = (uint8_t*)heap_caps_malloc(_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (_img8 == nullptr) return false;
+    }
+
+    return true;
+}
+
+bool VGA_Sprite::create(int x, int y, uint16_t col) {
+    if (_created && _width == x && _height == y) {
+        memset(_vga.getColorBits() == 16 ? (void*)_img16 : (void*)_img8, 
+        ((_vga.getColorBits() == 16) ? col : (uint8_t)(col & 0xFF)), 
+        _size);
+        
+        return true;
+    }
+
+    if (x == 0 || y == 0 || !allocateMemory(x, y)) return false;
+
+    _scrWidth = _vga.frameWidth();
+    _xx = _width - 1;
+    _yy = _height - 1;
+    _aniSize = _width * _width;
+    if (_vga.getColorBits() == 16) _aniSize <<= 1;
+
+    _created = true;
+    cls(col);
+
+    Serial.printf("VGA_Sprite created: %dx%d (%d-bit)(%d-byte)\n", _width, _height, _vga.getColorBits(), _size);
+
+    return true;
+}
+
+void VGA_Sprite::destroy() {
+    if (_img16) {
+        heap_caps_free(_img16);
+        _img16 = nullptr;
+    }
+
+    if (_img8) {
+        heap_caps_free(_img8);
+        _img8 = nullptr;
+    }
+
+    _width = _height = _size = 0;
+    _created = false;
+}
+
+//Draw------------------------------------------------------------------------
+void VGA_Sprite::cls(uint16_t col) {
+    if (!_created || _buff == nullptr) return;
+
+    if (_vga.getColorBits() == 16) {
+        uint8_t* ptr = (uint8_t*)_img16;
+        uint8_t* buf = _buff;
+
+        size_t sizeX = _width;  
+        uint8_t bh = (col >> 8) & 0xFF;
+        uint8_t bl = col & 0xFF;
+
+        while (sizeX-- > 0){
+            *buf++ = bh;
+            *buf++ = bl;
+        }
+
+        int sizeY = _height;
+        sizeX = _width << 1; // ширина в байтах
+
+        while (sizeY-- > 0) {
+            memcpy(ptr, _buff, sizeX);
+            ptr += sizeX;
+        }
+    } else {
+        memset(_img8, (uint8_t)(col & 0xFF), _size); 
+    }
+}
+
+void VGA_Sprite::putPixel(int x, int y, uint16_t col) {
+    if (!_created || x >= _width || y >= _height || x < 0 || y < 0) return;
+    
+    int offset = _width * y + x; 
+    if (_vga.getColorBits() == 16){
+        uint16_t* img = _img16 + offset;
+        *img = col;
+    } else {
+        uint8_t* img = _img8 + offset;
+        *img = (uint8_t)(col & 0xFF);
+    }
+}
+
+void VGA_Sprite::hLine(int x1, int y, int x2, uint16_t col){
+    if (!_created) return;
+
+    if (x2 < x1) std::swap(x1, x2);
+    if (x2 < 0 || x1 >= _width ||  y < 0 || y >= _height) return;
+
+    x1 = std::max(x1, 0);
+    x2 = std::min(x2, _width - 1);
+    int size = x2 - x1 + 1;
+    
+    int offset = _width * y +  x1; 
+    if (_vga.getColorBits() == 16){
+        uint16_t* img = _img16 + offset;
+        while (size-- > 0) *img++ = col;
+    } else {
+        memset(_img8 + offset, (uint8_t)(col & 0xFF), size);
+    }    
+}
+
+void VGA_Sprite::vLine(int x, int y1, int y2, uint16_t col){
+    if (!_created) return;
+
+    if (y2 < y1) std::swap(y1, y2);
+    if (y2 < 0 || y1 >= _width ||  x < 0 || x >= _width) return;
+
+    y1 = std::max(y1, 0);
+    y2 = std::min(y2, _height - 1);
+    int size = y2 - y1 + 1;
+    
+    int offset = _width * y1 + x; 
+    if (_vga.getColorBits() == 16){
+        uint16_t* img = _img16 + offset;
+
+        while (size-- > 0){
+            *img = col;
+            img += _width;
+        }    
+    } else {
+        uint8_t* img = _img8 + offset;
+        uint8_t color = (uint8_t)(col & 0xFF);
+
+        while (size-- > 0){
+            *img = color;
+            img += _width;
+        }  
+    }   
+}
+
+//Load------------------------------------------------------------------------
+bool VGA_Sprite::loadImage(const uint8_t *img, int index) {
+    if (img == nullptr || index < 0) return false;
+    if (_img8 != nullptr) destroy();
+
+    const uint8_t* imgStart = img;  // сохраним начало
+
+    uint8_t colorDepth = *img++;
+    if (colorDepth != 0x08 && colorDepth != 0x10) return false;
+
+    uint8_t numSprites = *img++;
+    if (index < 0 || index >= numSprites) return false;
+
+    // Перейти к смещению нужного спрайта
+    img += index * 4;
+    int pos = ((int)(*(img++) & 0xFF) << 24) |
+              ((int)(*(img++) & 0xFF) << 16) |
+              ((int)(*(img++) & 0xFF) << 8)  |
+              ((int)(*(img++) & 0xFF));
+
+    // Переход к данным изображения
+    const uint8_t* imgData = imgStart + 2 + numSprites * 4 + pos;
+
+    int width  = ((int)(*(imgData++) & 0xFF) << 8) | ((int)(*(imgData++) & 0xFF));
+    int height = ((int)(*(imgData++) & 0xFF) << 8) | ((int)(*(imgData++) & 0xFF));
+
+    if (!create(width, height)) return false;
+
+    uint8_t* dst = _img8;
+    while (height-- > 0) {
+        memcpy(dst, imgData, width);
+        dst += width;
+        imgData += width;
+    }
+
+    return true;
+}
+
+//----------------------------------------------------------------------------
+void VGA_Sprite::putImage(int x, int y, bool mirrorY) {
+    if (!_created) return;
+
+    int x2 = x + _width - 1;
+    int y2 = y + _height - 1;
+
+    if (x > _vga.getvX2() || y > _vga.getvY2() || x2 < _vga.getvX1() || y2 < _vga.getvY1())
+        return; // полностью за пределами экрана
+
+    // Координаты начала отрисовки
+    int dx = std::max(x, _vga.getvX1());
+    int dy = std::max(y, _vga.getvY1());
+
+    // Смещение внутри спрайта
+    int sx = dx - x;
+    int sy = dy - y;
+
+    // Размер отрисовываемой части
+    int sizex = std::min(x2, _vga.getvX2()) - dx + 1;
+    int sizey = std::min(y2, _vga.getvY2()) - dy + 1;
+
+    int scrWidth = _vga.frameWidth();
+    int scrOffset = (scrWidth == 640) ? _math.fastY_640[dy] + dx: _math.fastY_320[dy] + dx;
+    int imgOffset = _width * (mirrorY ? (_height - 1 - sy) : sy) + sx;
+    int imgAdd = mirrorY ? -_width : _width;
+
+    if (_vga.getColorBits() == 16) {
+        sizex <<= 1; // умножаем на 2 байта
+        uint16_t* dest = _vga.getDrawBuffer16() + scrOffset;
+        uint16_t* sour = _img16 + imgOffset;
+
+        while (sizey-- > 0) {
+            memcpy(dest, sour, sizex);
+            dest += scrWidth;
+            sour += imgAdd;
+        }
+    } else {
+        uint8_t* dest = _vga.getDrawBuffer() + scrOffset;
+        uint8_t* sour = _img8 + imgOffset;
+
+        while (sizey-- > 0) {
+            memcpy(dest, sour, sizex);
+            dest += scrWidth;
+            sour += imgAdd;
+        }
+    }
+}
+
+void VGA_Sprite::putSprite(int x, int y, uint16_t col, bool mirrorY){
+    if (!_created) return;
+
+    int x2 = x + _width - 1;
+    int y2 = y + _height - 1;
+
+    if (x > _vga.getvX2() || y > _vga.getvY2() || x2 < _vga.getvX1() || y2 < _vga.getvY1())
+        return; // полностью за пределами экрана
+
+    // Координаты начала отрисовки
+    int dx = std::max(x, _vga.getvX1());
+    int dy = std::max(y, _vga.getvY1());
+
+    // Смещение внутри спрайта
+    int sx = dx - x;
+    int sy = dy - y;
+
+    // Размер отрисовываемой части
+    int sizex = std::min(x2, _vga.getvX2()) - dx + 1;
+    int sizey = std::min(y2, _vga.getvY2()) - dy + 1;
+
+    int scrWidth = _vga.frameWidth();
+    int scrOffset = (scrWidth == 640) ? _math.fastY_640[dy] + dx: _math.fastY_320[dy] + dx;
+    int imgOffset = _width * (mirrorY ? (_height - 1 - sy) : sy) + sx;
+    int imgAdd = mirrorY ? -_width : _width;
+    int skipScr = scrWidth - sizex;
+    int skipImg = _width - sizex;
+    int xx;
+
+    if (_vga.getColorBits() == 16) {
+        uint16_t* dest = _vga.getDrawBuffer16() + scrOffset;
+        uint16_t* sour = _img16 + imgOffset;
+
+        while (sizey-- > 0) {
+            xx = sizex;
+
+            while (xx-- > 0){
+                if (*sour != col) *dest = *sour;
+                
+                dest++;
+                sour++;
+            }
+
+            dest += skipScr;
+            sour += skipImg;
+        }
+    } else {
+        uint8_t* dest = _vga.getDrawBuffer() + scrOffset;
+        uint8_t* sour = _img8 + imgOffset;
+        uint8_t color = (uint8_t)(col & 0xFF);
+
+        while (sizey-- > 0) {
+            xx = sizex;
+
+            while (xx-- > 0){
+                if (*sour != color) *dest = *sour;
+                
+                dest++;
+                sour++;
+            }
+
+            dest += skipScr;
+            sour += skipImg;
+        }
+    }    
+}
+
+void VGA_Sprite::putAniImage(int x, int y, uint8_t index, uint16_t col, bool mirrorY){
+    if (!_created) return;
+
+    int x2 = x + _width - 1;
+    int y2 = y + _width - 1;
+
+    if (x > _vga.getvX2() || y > _vga.getvY2() || x2 < _vga.getvX1() || y2 < _vga.getvY1())
+        return; // полностью за пределами экрана
+
+    // Координаты начала отрисовки
+    int dx = std::max(x, _vga.getvX1());
+    int dy = std::max(y, _vga.getvY1());
+
+    // Смещение внутри спрайта
+    int sx = dx - x;
+    int sy = dy - y;
+
+    // Размер отрисовываемой части
+    int sizex = std::min(x2, _vga.getvX2()) - dx + 1;
+    int sizey = std::min(y2, _vga.getvY2()) - dy + 1;
+
+    int scrWidth = _vga.frameWidth();
+    int scrOffset = (scrWidth == 640) ? _math.fastY_640[dy] + dx: _math.fastY_320[dy] + dx;
+    int imgOffset = _width * (mirrorY ? (_height - 1 - sy) : sy) + sx;
+    imgOffset += index * _width * _width;
+    int imgAdd = mirrorY ? -_width : _width;
+    int skipScr = scrWidth - sizex;
+    int skipImg = _width - sizex;
+    int xx;
+
+    if (_vga.getColorBits() == 16) {
+        sizex <<= 1; // умножаем на 2 байта
+        uint16_t* dest = _vga.getDrawBuffer16() + scrOffset;
+        uint16_t* sour = _img16 + imgOffset;
+
+        while (sizey-- > 0) {
+            memcpy(dest, sour, sizex);
+            dest += scrWidth;
+            sour += imgAdd;
+        }
+    } else {
+        uint8_t* dest = _vga.getDrawBuffer() + scrOffset;
+        uint8_t* sour = _img8 + imgOffset;
+
+        while (sizey-- > 0) {
+            memcpy(dest, sour, sizex);
+            dest += scrWidth;
+            sour += imgAdd;        
+        }
+    }  
+}
+
+void VGA_Sprite::putAniSprite(int x, int y, uint8_t index, uint16_t col, bool mirrorY){
+    if (!_created) return;
+
+    int x2 = x + _xx;
+    int y2 = y + _xx;
+
+    if (x > _vga.getvX2() || y > _vga.getvY2() || x2 < _vga.getvX1() || y2 < _vga.getvY1())
+        return; // полностью за пределами экрана
+
+    // Координаты начала отрисовки
+    int dx = std::max(x, _vga.getvX1());
+    int dy = std::max(y, _vga.getvY1());
+
+    // Смещение внутри спрайта
+    int sx = dx - x;
+    int sy = dy - y;
+
+    // Размер отрисовываемой части
+    int sizex = std::min(x2, _vga.getvX2()) - dx + 1;
+    int sizey = std::min(y2, _vga.getvY2()) - dy + 1;
+
+    int scrOffset = (_scrWidth == 640) ? _math.fastY_640[dy] + dx: _math.fastY_320[dy] + dx;
+    int imgOffset = _width * (mirrorY ? (_yy - sy) : sy) + sx;
+    imgOffset += index * _aniSize;
+    int imgAdd = mirrorY ? -_width : _width;
+    int skipScr = _scrWidth - sizex;
+    int skipImg = _width - sizex; 
+    int xx;
+
+    if (_vga.getColorBits() == 16) {
+        uint16_t* dest = _vga.getDrawBuffer16() + scrOffset;
+        uint16_t* sour = _img16 + imgOffset;
+
+        while (sizey-- > 0) {
+            xx = sizex;
+
+            while (xx-- > 0){
+                if (*sour != col) *dest = *sour;
+                
+                dest++;
+                sour++;
+            }
+
+            dest += skipScr;
+            sour += skipImg;
+        }
+    } else {
+        uint8_t* dest = _vga.getDrawBuffer() + scrOffset;
+        uint8_t* sour = _img8 + imgOffset;
+        uint8_t color = (uint8_t)(col & 0xFF);
+
+        while (sizey-- > 0) {
+            xx = sizex;
+
+            while (xx-- > 0){
+                if (*sour != color) *dest = *sour;
+                
+                dest++;
+                sour++;
+            }
+
+            dest += skipScr;
+            sour += skipImg;
+        }
+    }  
+}
+/*
 bool VGA_Sprite::allocateMemory() {
     switch (_colorBits) {
         case 16:
@@ -366,8 +785,8 @@ void VGA_Sprite::putSpriteAngleMem(const uint8_t *img, int index, int x, int y, 
     int cx = width >> 1;
     int cy = height >> 1;
 
-    float sinAngle = sinLUT[angle % 360];
-    float cosAngle = cosLUT[angle % 360];
+    float sinAngle = _math._sinLUT[angle % 360];
+    float cosAngle = _math._cosLUT[angle % 360];
 
     //int radius = sqrt(cx * cx + cy * cy);
     int offsetX = max(cx + 1, cy + 1);//radius;
@@ -404,7 +823,7 @@ void VGA_Sprite::putSpriteAngleMem(const uint8_t *img, int index, int x, int y, 
 /*
     Serial.print(width); Serial.print("x"); Serial.println(height);
     delay(500);
-    */
+    
 
 //Image-------------------------------------------------------------------------------------------------------------------------------------
 void VGA_Sprite::putBG(int x, int y, bool repeat, bool mirror_y) {
@@ -479,7 +898,7 @@ void VGA_Sprite::putBG(int x, int y, bool repeat) {
         }
     }
 }
-*/
+
 void VGA_Sprite::putImage(int x, int y, bool mirror) {
     if (!_created) return;
 
@@ -576,8 +995,8 @@ void VGA_Sprite::putSpriteAngle(int x, int y, int angle, uint16_t maskColor) {
     int vy1 = _vga.getvY1(), vy2 = _vga.getvY2();
     int cx = _width >> 1, cy = _height >> 1;
 
-    int sinAngle = sinLUT[angle % 360];
-    int cosAngle = cosLUT[angle % 360];
+    int sinAngle = _math._sinLUT[angle % 360];
+    int cosAngle = _math._cosLUT[angle % 360];
 
     int offsetX = max(cx + 1, cy + 1);
     int offsetY = offsetX;
@@ -814,7 +1233,7 @@ void VGA_Sprite::putSprite(int x, int y, uint16_t maskColor, bool mirror_x, bool
         }      
     }   
 }
-*/
+
 void VGA_Sprite::putSpriteFade(int x, int y, uint16_t maskColor, uint8_t fade_r, uint8_t fade_g, uint8_t fade_b) {
     if (!_created) return;
 
@@ -1013,4 +1432,25 @@ void VGA_Sprite::putImage(int x, int y) {
         sour += _width;
     }
 }
+
+
+        // Освобождение fastY
+        /*
+        if (_fastY) {
+            delete[] _fastY;
+            _fastY = nullptr;
+        }
+
+        // Обнуление состояния
+
+    // Выделение и заполнение таблицы смещений по строкам
+    /*
+    _fastY = new int[_height];
+    if (!_fastY) {
+        destroy();  // Освободить всё, если не удалось
+        return false;
+    }
+    for (int i = 0; i < _height; i++)
+        _fastY[i] = i * _width;
+
 */
